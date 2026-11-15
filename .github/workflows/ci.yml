@@ -1,0 +1,237 @@
+---
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  hadolint:
+    name: hadolint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387
+        with:
+          dockerfile: .devcontainer/Dockerfile
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7
+        with:
+          version: 1.7.12
+          pyflakes: false
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38
+        with:
+          version: v0.11.0
+          scandir: tests
+
+  yamllint:
+    name: yamllint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ibiqlik/action-yamllint@2576378a8e339169678f9939646ee3ee325e845c
+        with:
+          format: github
+
+  ruff:
+    name: Ruff
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89
+        with:
+          version: 0.17.5
+          args: check
+      - uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89
+        with:
+          version: 0.17.5
+          args: format --check
+
+  build:
+    name: Build
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    # yamllint disable-line rule:line-length
+    uses: docker/github-builder/.github/workflows/build.yml@a31d2311da4d55e21b978c1c52bab82ba97d51ee
+    with:
+      runner: |
+        default=ubuntu-24.04
+        linux/arm64=ubuntu-24.04-arm
+      output: image
+      push: true
+      context: .devcontainer
+      platforms: linux/amd64,linux/arm64
+      sbom: true
+      cache: true
+      cache-scope: image
+      cache-mode: max
+      meta-images: ghcr.io/${{ github.repository }}
+      meta-tags: 3.12-trixie-${{ github.run_id }}-${{ github.run_attempt }}
+      set-meta-labels: true
+      set-meta-annotations: true
+      meta-labels: >-
+        org.opencontainers.image.description=Personal Python 3.12 development
+        container image with uv and GitHub CLI
+      meta-annotations: >-
+        org.opencontainers.image.description=Personal Python 3.12 development
+        container image with uv and GitHub CLI
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    name: Test (${{ matrix.arch }})
+    needs: build
+    if: >-
+      !cancelled() &&
+      (github.event_name == 'pull_request' || needs.build.result == 'success')
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      IMAGE_REF: >-
+        ${{ github.event_name == 'pull_request'
+        && 'local/python-devcontainer:pr'
+        || format('ghcr.io/{0}@{1}', github.repository,
+        needs.build.outputs.digest) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      # Keep the docker driver as default so the Dev Containers CLI can build
+      # on the loaded image.
+      - id: buildx
+        if: github.event_name == 'pull_request'
+        # yamllint disable-line rule:line-length
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+        with:
+          use: false
+      - if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .devcontainer
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: ${{ env.IMAGE_REF }}
+          cache-from: type=gha,scope=image-linux-${{ matrix.arch }}
+          cache-to: type=gha,scope=image-linux-${{ matrix.arch }},mode=max
+
+      - if: github.event_name == 'push'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - if: github.event_name == 'push'
+        run: docker pull --platform "linux/${{ matrix.arch }}" "$IMAGE_REF"
+
+      - name: Test image
+        run: tests/test-image.sh "$IMAGE_REF"
+      - name: Test devcontainer
+        run: tests/test-devcontainer.sh "$IMAGE_REF"
+
+      - name: Vulnerability report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          version: v0.76.2
+          image-ref: ${{ env.IMAGE_REF }}
+          scanners: vuln
+          trivyignores: .trivyignore.yaml
+      - name: Vulnerability check
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          version: v0.76.2
+          skip-setup-trivy: true
+          image-ref: ${{ env.IMAGE_REF }}
+          scanners: vuln
+          trivyignores: .trivyignore.yaml
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+  deploy:
+    name: Deploy
+    needs: [hadolint, actionlint, shellcheck, yamllint, ruff, build, test]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+      MOVING_TAG: 3.12-trixie
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Move ${{ env.MOVING_TAG }} to the tested digest
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [[ $head != "$GITHUB_SHA" ]]; then
+            echo "::notice::Not moving $MOVING_TAG because main is now at $head"
+            exit 0
+          fi
+
+          platforms=$(docker buildx imagetools inspect --raw "$IMAGE@$DIGEST" \
+            | jq -r '[.manifests[].platform | select(.os == "linux")
+              | "\(.os)/\(.architecture)"] | sort | join(" ")')
+          echo "platforms: $platforms"
+          [[ $platforms == "linux/amd64 linux/arm64" ]]
+
+          docker buildx imagetools create --tag "$IMAGE:$MOVING_TAG" \
+            "$IMAGE@$DIGEST"
+          moved=$(docker buildx imagetools inspect \
+            --format '{{.Manifest.Digest}}' "$IMAGE:$MOVING_TAG")
+          [[ $moved == "$DIGEST" ]]
+          echo "::notice::$IMAGE:$MOVING_TAG -> $DIGEST"

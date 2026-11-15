@@ -1,0 +1,14 @@
+{
+  "name": "Python 3.12",
+  "image": "ghcr.io/navan-hassan/python-devcontainer:3.12-trixie",
+  "remoteUser": "vscode",
+  "postCreateCommand": "uv sync --locked",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python"],
+      "settings": {
+        "python.defaultInterpreterPath": "/home/vscode/.venv/bin/python"
+      }
+    }
+  }
+}
