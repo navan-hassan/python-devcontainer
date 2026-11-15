@@ -1,0 +1,16 @@
+---
+vulnerabilities:
+  - id: CVE-2026-78661
+    paths:
+      - usr/local/bin/gh
+    purls:
+      - pkg:golang/golang.org/x/net@v0.61.0
+    statement: >-
+      gh 2.104.0 (latest release as of 2026-11-15) is built with x/net v0.61.0
+      and links the vulnerable html.Parse. Reproduce with
+      `go run golang.org/x/vuln/cmd/govulncheck@v1.9.0
+      -mode=binary /usr/local/bin/gh`, which reports GO-2026-6860. Impact is
+      CPU exhaustion of a local, interruptible CLI process on crafted HTML.
+      No fixed gh release exists (as of 2026-11-15). Remove when GH_VERSION is
+      updated to a release built with x/net >= v0.62.0.
+    expired_at: 2026-12-31
